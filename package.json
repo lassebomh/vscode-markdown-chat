@@ -3,6 +3,7 @@
   "displayName": "markdown-chat",
   "description": "",
   "version": "0.0.1",
+  "repository": "https://github.com/lassebomh/vscode-markdown-chat",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -13,11 +14,11 @@
   "main": "./out/extension.js",
   "contributes": {
     "keybindings": [
-        {
-            "command": "markdown-chat.send-markdown-chat",
-            "key": "ctrl+enter",
-            "when": "editorTextFocus && editorLangId == 'markdown'"
-        }
+      {
+        "command": "markdown-chat.send-markdown-chat",
+        "key": "ctrl+enter",
+        "when": "editorTextFocus && editorLangId == 'markdown'"
+      }
     ],
     "configuration": {
       "title": "API Key Configuration",
@@ -60,6 +61,7 @@
     "@typescript-eslint/eslint-plugin": "^5.59.8",
     "@typescript-eslint/parser": "^5.59.8",
     "@vscode/test-electron": "^2.3.2",
+    "@vscode/vsce": "^2.19.0",
     "eslint": "^8.41.0",
     "glob": "^8.1.0",
     "mocha": "^10.2.0",

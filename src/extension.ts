@@ -130,13 +130,11 @@ export function activate(context: vscode.ExtensionContext) {
 
         vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
-            title: "Getting response",
+            title: "Getting answer from OpenAI...",
             cancellable: true
         }, (progress, token) => {
             token.onCancellationRequested(() => {
                 finish_reason = 'cancelled';
-                console.log('Cancelled!!!');
-                
             });
         
             return responsePromise;
@@ -153,7 +151,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         if (finish_reason !== 'stop') {
-            vscode.window.showInformationMessage('Stop reason: ' + finish_reason);
+            vscode.window.showInformationMessage('Stopped. Reason: ' + finish_reason);
         } else {
             await appendChunk('\n\n[user]\n\n', true);
         }
