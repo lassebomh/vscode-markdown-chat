@@ -57,14 +57,15 @@ function activate(context) {
         let text = document.getText();
         let options = {
             ...config.get('defaultMarkdownChat'),
-            ...serializeMarkdownChat(text)
+            ...serializeMarkdownChat(text),
+            stream: true,
         };
         if (options.messages.length === 0) {
             vscode.window.showErrorMessage("The chat doesn't contain any messages");
             return;
         }
         const openai = new openai_1.default({ apiKey: config.get('apiKey') });
-        const stream = await openai.chat.completions.create(options, { stream: true });
+        const stream = await openai.chat.completions.create(options);
         const endNewlinesMatch = text.match(/\n*$/);
         const endNewlinesCountDiff = 2 - (endNewlinesMatch ? endNewlinesMatch[0].length : 0);
         let chunks = [];
@@ -120,7 +121,7 @@ function activate(context) {
         if (finish_reason !== 'stop' && finish_reason !== 'user') {
             vscode.window.showErrorMessage('Stopped. Reason: ' + finish_reason);
         }
-        else {
+        if (finish_reason === 'stop') {
             await appendChunk('\n\n> user\n\n', true);
         }
         resolveResponse();

@@ -69,7 +69,8 @@ export function activate(context: vscode.ExtensionContext) {
 
         let options: {stream: true; model: string; messages: any} & {[key: string]: any;} = {
             ...<any>config.get('defaultMarkdownChat'),
-            ...serializeMarkdownChat(text)
+            ...serializeMarkdownChat(text),
+            stream: true,
         };
 
         if (options.messages.length === 0) {
@@ -79,7 +80,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         const openai = new OpenAI({apiKey: config.get('apiKey')});
 
-        const stream = await openai.chat.completions.create(options, {stream: true});
+        const stream = await openai.chat.completions.create(options);
 
         const endNewlinesMatch = text.match(/\n*$/);
         const endNewlinesCountDiff = 2 - (endNewlinesMatch ? endNewlinesMatch[0].length : 0);
@@ -153,7 +154,9 @@ export function activate(context: vscode.ExtensionContext) {
 
         if (finish_reason !== 'stop' && finish_reason !== 'user') {
             vscode.window.showErrorMessage('Stopped. Reason: ' + finish_reason);
-        } else {
+        }
+
+        if (finish_reason === 'stop') {
             await appendChunk('\n\n> user\n\n', true);
         }
 
