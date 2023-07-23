@@ -154,9 +154,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         if (finish_reason !== 'stop' && finish_reason !== 'user') {
             vscode.window.showErrorMessage('Stopped. Reason: ' + finish_reason);
-        }
-
-        if (finish_reason === 'stop') {
+        } else {
             await appendChunk('\n\n> user\n\n', true);
         }
 
