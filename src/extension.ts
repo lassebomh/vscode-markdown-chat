@@ -6,29 +6,51 @@ import * as yaml from 'js-yaml';
 import OpenAI from 'openai';
 
 
+function serializeMarkdownChat(text: string): any {
+    let options: any = {};
 
-const defaultOptions = {
-    "model": "gpt-4",
-    "temperature": 0.7,
-    "max_tokens": 100,
-};
+    let metadataSplit = text.split(/^-{3}$/gm);
+    let messagesText = text;
 
-const defaultFileContents = `\
----
-${yaml.dump(defaultOptions)}---
+    if (metadataSplit.length > 2 && metadataSplit[0] === '') {
+        options = <any>yaml.load(metadataSplit[1]);
+        messagesText = metadataSplit[2];
+    }
 
-[system]
+    let messagesSplit: string[] = messagesText.split(/(^|\n)\n?> (\w+) *\n{0,2}/g);
 
-You are a helpful assistant
+    options['messages'] = [];
+    
+    for(let i=1; i < messagesSplit.length; i+=3){
+        options['messages'].push({
+            role: messagesSplit[i+1],
+            content: messagesSplit[i+2]
+        });
+    }
 
-[user]
+    return options;
+}
 
-`;
+function unserializeMarkdownChat(options: any): string {
+    options = {...options};
+    
+    let messages = options['messages'];
+    delete options['messages'];
+    
+    let messagesText = '';
+
+    for (const message of messages) {
+        messagesText += `> ${message.role}\n\n${message.content}`;
+        if (message.content) {messagesText += "\n\n";}
+    }
+
+    return '---\n' + yaml.dump(options) + '---\n\n' + messagesText;
+}
 
 export function activate(context: vscode.ExtensionContext) {
 
     let setApiKey = vscode.commands.registerCommand('markdown-chat.setApiKey', () => {
-        vscode.window.showInputBox({ prompt: 'Enter API Key' }).then(value => {
+        vscode.window.showInputBox({ prompt: 'Enter your OpenAI API Key' }).then(value => {
             if (value !== undefined) {
                 let config = vscode.workspace.getConfiguration('markdown-chat');
                 config.update('apiKey', value, vscode.ConfigurationTarget.Global);
@@ -36,49 +58,28 @@ export function activate(context: vscode.ExtensionContext) {
         });
     });
 	
-    let completeMarkdownChat = vscode.commands.registerCommand('markdown-chat.send-markdown-chat', async () => {
+    let completeMarkdownChat = vscode.commands.registerCommand('markdown-chat.sendMarkdownChat', async () => {
+        let config = vscode.workspace.getConfiguration('markdown-chat');
+
         const editor = vscode.window.activeTextEditor;
-        
-        if (!editor) {
+        if (!editor) {return;}
+
+        const document = editor.document;
+		let text = document.getText();
+
+        let options: {stream: true; model: string; messages: any} & {[key: string]: any;} = {
+            ...<any>config.get('defaultMarkdownChat'),
+            ...serializeMarkdownChat(text)
+        };
+
+        if (options.messages.length === 0) {
+            vscode.window.showErrorMessage("The chat doesn't contain any messages");
             return;
         }
 
-        const document = editor.document;
+        const openai = new OpenAI({apiKey: config.get('apiKey')});
 
-		let text = document.getText();
-
-		let documentOptionsSplit = text.split(/^-{3}$/gm);
-        let options = defaultOptions;
-        let messagesText = text;
-
-		if (documentOptionsSplit.length > 2 && documentOptionsSplit[0] === '') {
-            options = {...options, ...<any>yaml.load(documentOptionsSplit[1])};
-            messagesText = documentOptionsSplit[2];
-		}
-
-        let messagesSplit: string[] = messagesText.split(/^\[([^\]]+)\] *$/gm);
-        messagesSplit.shift();
-        
-        let messages: any = [];
-        
-        for(let i = 0; i < messagesSplit.length; i+=2){
-            messages.push({
-                role: messagesSplit[i],
-                content: messagesSplit[i+1]
-            });
-        }
-        
-        let config = vscode.workspace.getConfiguration('markdown-chat');
-
-        const openai = new OpenAI({
-            apiKey: config.get('apiKey')
-        });
-
-        const stream = await openai.chat.completions.create({
-            ...options,
-            messages: messages,
-            stream: true,
-        });
+        const stream = await openai.chat.completions.create(options, {stream: true});
 
         const endNewlinesMatch = text.match(/\n*$/);
         const endNewlinesCountDiff = 2 - (endNewlinesMatch ? endNewlinesMatch[0].length : 0);
@@ -118,7 +119,7 @@ export function activate(context: vscode.ExtensionContext) {
             await appendChunk('\n'.repeat(endNewlinesCountDiff));
         }
 
-        await appendChunk('[assistant]\n\n');
+        await appendChunk('> assistant\n\n');
 
         let finish_reason: string | null = null;
 
@@ -134,7 +135,7 @@ export function activate(context: vscode.ExtensionContext) {
             cancellable: true
         }, (progress, token) => {
             token.onCancellationRequested(() => {
-                finish_reason = 'cancelled';
+                finish_reason = 'user';
             });
         
             return responsePromise;
@@ -150,18 +151,22 @@ export function activate(context: vscode.ExtensionContext) {
             finish_reason = part.choices[0]?.finish_reason;
         }
 
-        if (finish_reason !== 'stop') {
-            vscode.window.showInformationMessage('Stopped. Reason: ' + finish_reason);
+        if (finish_reason !== 'stop' && finish_reason !== 'user') {
+            vscode.window.showErrorMessage('Stopped. Reason: ' + finish_reason);
         } else {
-            await appendChunk('\n\n[user]\n\n', true);
+            await appendChunk('\n\n> user\n\n', true);
         }
 
         resolveResponse!();
 
 	});
 
-    let newMarkdownChat = vscode.commands.registerCommand('markdown-chat.new-markdown-chat', async () => {
-        const document = await vscode.workspace.openTextDocument({ content: defaultFileContents, language: 'markdown' });
+    let newMarkdownChat = vscode.commands.registerCommand('markdown-chat.newMarkdownChat', async () => {
+        let config = vscode.workspace.getConfiguration('markdown-chat');
+
+        let text = unserializeMarkdownChat(config.get('defaultMarkdownChat'));
+
+        const document = await vscode.workspace.openTextDocument({ content: text, language: 'markdown' });
         const editor = await vscode.window.showTextDocument(document);
 
         const position = editor.document.lineAt(document.lineCount - 1).range.end;
@@ -169,7 +174,33 @@ export function activate(context: vscode.ExtensionContext) {
         editor.selection = newSelection;
 	});
 
-	context.subscriptions.push(setApiKey, completeMarkdownChat, newMarkdownChat);
+    
+    let setMarkdownChatAsDefault = vscode.commands.registerCommand('markdown-chat.setMarkdownChatAsDefault', () => {
+        let config = vscode.workspace.getConfiguration('markdown-chat');
+
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showErrorMessage('No document is open.');
+            return;
+        }
+
+        const document = editor.document;
+		let text = document.getText();
+
+        let markdownChat = serializeMarkdownChat(text);
+
+        console.log(markdownChat);
+
+        if (!('model' in markdownChat)) {
+            vscode.window.showErrorMessage('The default chat needs at least "model" in its metadata.');
+            return;
+        }
+
+        config.update('defaultMarkdownChat', markdownChat, vscode.ConfigurationTarget.Global);
+        vscode.window.showInformationMessage('The default chat has been set to the current document.');
+    });
+
+	context.subscriptions.push(setApiKey, completeMarkdownChat, newMarkdownChat, setMarkdownChatAsDefault);
 }
 
 // This method is called when your extension is deactivated

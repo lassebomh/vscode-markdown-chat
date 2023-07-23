@@ -1,6 +1,6 @@
 {
   "name": "markdown-chat",
-  "displayName": "markdown-chat",
+  "displayName": "Markdown Chat",
   "description": "",
   "version": "0.0.1",
   "repository": "https://github.com/lassebomh/vscode-markdown-chat",
@@ -15,18 +15,37 @@
   "contributes": {
     "keybindings": [
       {
-        "command": "markdown-chat.send-markdown-chat",
+        "command": "markdown-chat.sendMarkdownChat",
         "key": "ctrl+enter",
         "when": "editorTextFocus && editorLangId == 'markdown'"
       }
     ],
     "configuration": {
-      "title": "API Key Configuration",
+      "title": "Markdown Chat",
       "properties": {
         "markdown-chat.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API Key"
+          "description": "OpenAI API key"
+        },
+        "markdown-chat.defaultMarkdownChat": {
+          "type": "object",
+          "default": {
+            "model": "gpt-4",
+            "temperature": 0.75,
+            "max_tokens": 500,
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a helpful assistant. Answer in markdown."
+              },
+              {
+                "role": "user",
+                "content": ""
+              }
+            ]
+          },
+          "description": "Default chat"
         }
       }
     },
@@ -36,12 +55,16 @@
         "title": "Set API Key"
       },
       {
-        "command": "markdown-chat.send-markdown-chat",
-        "title": "Send Markdown Chat"
+        "command": "markdown-chat.sendMarkdownChat",
+        "title": "Send chat"
       },
       {
-        "command": "markdown-chat.new-markdown-chat",
-        "title": "New Markdown Chat"
+        "command": "markdown-chat.newMarkdownChat",
+        "title": "New chat"
+      },
+      {
+        "command": "markdown-chat.setMarkdownChatAsDefault",
+        "title": "Set current document as the default chat"
       }
     ]
   },
