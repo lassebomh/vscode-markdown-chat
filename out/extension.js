@@ -35,6 +35,7 @@ const yaml = __importStar(require("js-yaml"));
 const openai_1 = __importDefault(require("openai"));
 const lite_1 = require("tiktoken/lite");
 const cl100k_base_json_1 = __importDefault(require("tiktoken/encoders/cl100k_base.json"));
+let lastCostStatusBarItem;
 const regexSplitMessages = /(^|\n)\n?\[([a-z]+)\] *\n{0,2}/g;
 const DEFAULT_PROMPT_TEMPLATE = {
     "mode": "chat",
@@ -108,8 +109,10 @@ function getContextModel(usageStore, tokens, model) {
 function countPromptTemplateInputTokens(encoding, options) {
     let num_tokens = 0;
     if (options['mode'] == 'chat') {
-        for (const message in options['messages']) {
-            num_tokens += encoding.encode(message.content).length;
+        for (let i = 0; i < options['messages'].length; i++) {
+            const message = options['messages'][i];
+            let tokens = encoding.encode(message.content);
+            num_tokens += tokens.length;
         }
         return num_tokens;
     }
@@ -118,7 +121,21 @@ function countPromptTemplateInputTokens(encoding, options) {
         return num_tokens;
     }
 }
+function updateLastCostStatusBarItem(cost) {
+    if (cost > 0) {
+        lastCostStatusBarItem.text = `$(debug-restart) ${Math.round(1 / cost * 10) / 10}/$   $(graph-line) ${Math.round(totalSessionCost * 1000) / 10} cents`;
+        lastCostStatusBarItem.show();
+    }
+    else {
+        lastCostStatusBarItem.hide();
+    }
+}
 function activate(context) {
+    // create a new status bar item that we can now manage
+    lastCostStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    context.subscriptions.push(lastCostStatusBarItem);
+    // update status bar item once at start
+    updateLastCostStatusBarItem(0);
     let setApiKey = vscode.commands.registerCommand('markdown-chat.setApiKey', () => {
         vscode.window.showInputBox({ prompt: 'Enter your OpenAI API Key' }).then(value => {
             if (value !== undefined) {
@@ -256,11 +273,14 @@ function activate(context) {
                 }
                 finish_reason = part.choices[0]?.finish_reason;
             }
-            let models = config.get('models');
+            let models = { ...config.get('models') };
             let model = options['model'];
             let ci = getContextModel(models, options.max_tokens, model);
             models[model][ci]['inputCount'] += inputTokenCount;
             models[model][ci]['outputCount'] += outputTokenCount;
+            let cost = inputTokenCount * models[model][ci]['inputPrice'] / 1000 + outputTokenCount * models[model][ci]['outputPrice'] / 1000;
+            totalSessionCost += cost;
+            updateLastCostStatusBarItem(cost);
             config.update('models', models, vscode.ConfigurationTarget.Global);
             if (finish_reason !== 'stop' && finish_reason !== 'user') {
                 throw new Error('Stopped. Reason: ' + finish_reason);

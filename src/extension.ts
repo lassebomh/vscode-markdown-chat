@@ -9,6 +9,8 @@ import { Tiktoken } from "tiktoken/lite";
 import cl100k_base from "tiktoken/encoders/cl100k_base.json";
 
 
+let lastCostStatusBarItem: vscode.StatusBarItem;
+
 const regexSplitMessages = /(^|\n)\n?\[([a-z]+)\] *\n{0,2}/g
 
 const DEFAULT_PROMPT_TEMPLATE = {
@@ -107,8 +109,10 @@ function countPromptTemplateInputTokens(encoding: any, options: any): number {
 
     if (options['mode'] == 'chat') {
 
-        for (const message in options['messages']) {
-            num_tokens += encoding.encode((<any>message).content).length
+        for (let i = 0; i < options['messages'].length; i++) {
+            const message = options['messages'][i];
+            let tokens = encoding.encode(message.content)
+            num_tokens += tokens.length
         }
 
         return num_tokens
@@ -119,7 +123,23 @@ function countPromptTemplateInputTokens(encoding: any, options: any): number {
 }
 
 
+function updateLastCostStatusBarItem(cost: number): void {
+	if (cost > 0) {
+		lastCostStatusBarItem.text = `$(debug-restart) ${Math.round(1/cost * 10) / 10}/$   $(graph-line) ${Math.round(totalSessionCost * 1000) / 10} cents`;
+		lastCostStatusBarItem.show();
+	} else {
+		lastCostStatusBarItem.hide();
+	}
+}
+
 export function activate(context: vscode.ExtensionContext) {
+
+	// create a new status bar item that we can now manage
+	lastCostStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+	context.subscriptions.push(lastCostStatusBarItem);
+
+	// update status bar item once at start
+    updateLastCostStatusBarItem(0)
 
     let setApiKey = vscode.commands.registerCommand('markdown-chat.setApiKey', () => {
         vscode.window.showInputBox({ prompt: 'Enter your OpenAI API Key' }).then(value => {
@@ -314,13 +334,20 @@ export function activate(context: vscode.ExtensionContext) {
             }
 
 
-            let models: {[key: string]: any} = config.get('models')!
+            let models: {[key: string]: any} = {... config.get('models')!}
+            
             let model = options['model']
 
             let ci = getContextModel(models, options.max_tokens, model)
 
             models[model][ci]['inputCount'] += inputTokenCount
             models[model][ci]['outputCount'] += outputTokenCount
+
+            let cost = inputTokenCount * models[model][ci]['inputPrice']/1000 + outputTokenCount * models[model][ci]['outputPrice']/1000
+            
+            totalSessionCost += cost
+
+            updateLastCostStatusBarItem(cost)
 
             config.update('models', models, vscode.ConfigurationTarget.Global);
 
