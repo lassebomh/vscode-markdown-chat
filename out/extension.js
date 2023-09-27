@@ -33,71 +33,133 @@ exports.deactivate = exports.activate = void 0;
 const vscode = __importStar(require("vscode"));
 const yaml = __importStar(require("js-yaml"));
 const openai_1 = __importDefault(require("openai"));
+const nunjucks = __importStar(require("nunjucks"));
 const lite_1 = require("tiktoken/lite");
 const cl100k_base_json_1 = __importDefault(require("tiktoken/encoders/cl100k_base.json"));
 let lastCostStatusBarItem;
-const regexSplitMessages = /(^|\n)\n?\[([a-z]+)\] *\n{0,2}/g;
+const regexSplitMessages = /(^|\n)\n?\[([a-zA-Z0-9\:\_]+)\] *\n{0,2}/g;
 const DEFAULT_PROMPT_TEMPLATE = {
     "mode": "chat",
-    "model": "gpt-4",
-    "temperature": 0.75,
-    "max_tokens": 500,
-    "messages": [
-        {
-            "role": "system",
-            "content": "You are a helpful assistant. Answer in markdown."
-        },
-        {
-            "role": "user",
-            "content": ""
-        }
-    ]
+    "options": {
+        "model": "gpt-4",
+        "temperature": 0.75,
+        "max_tokens": 500,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Answer in markdown."
+            },
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {
+                    'name': 'get_weather',
+                    'arguments': '{"region": "USA"}'
+                }
+            },
+            {
+                "role": "function",
+                "name": "get_weather",
+                "content": "The result of the function"
+            }
+        ]
+    }
 };
 let completionInProgress = false;
 let totalSessionCost = 0;
-function serializePromptTemplate(text) {
-    let options = {};
+async function serializePromptTemplate(text, interactive = false) {
+    let template = {};
     const metadataSplit = text.split(/^---\n/m);
     let rawPrompt = text;
     if (metadataSplit[0] === "" && metadataSplit.length >= 3) {
-        options = yaml.load(metadataSplit[1]);
+        template = yaml.load(metadataSplit[1]);
         rawPrompt = metadataSplit.slice(2).join("---");
     }
-    const mode = options["mode"] || "chat";
-    if (mode === "chat") {
+    if (template.nunjucks !== false && interactive) {
+        let env = new nunjucks.Environment();
+        if (typeof template.nunjucks === 'object') {
+            env.options = template.nunjucks;
+        }
+        let context = { ...template };
+        if (template.inputs != null) {
+            for (let i = 0; i < template.inputs.length; i++) {
+                const input = template.inputs[i];
+                let value = input.value;
+                let prompt = input.prompt;
+                if (prompt) {
+                    value = await new Promise((resolve, reject) => {
+                        vscode.window
+                            .showInputBox({
+                            prompt: `Assign ${input.name} a value`,
+                            ignoreFocusOut: true,
+                            value: input.value || '',
+                        })
+                            .then(resolve, reject);
+                    });
+                }
+                context[input.name] = value;
+            }
+        }
+        rawPrompt = env.renderString(rawPrompt, context);
+    }
+    if (template.mode === "chat") {
         const messagesSplit = rawPrompt.split(regexSplitMessages);
-        options["messages"] = [];
+        console.log(messagesSplit);
+        template.options.messages = [];
         for (let i = 1; i < messagesSplit.length; i += 3) {
-            options["messages"].push({ "role": messagesSplit[i + 1], "content": messagesSplit[i + 2] });
+            let [role, name] = messagesSplit[i + 1].split(':');
+            let content = messagesSplit[i + 2];
+            let function_call;
+            console.log(role, name, content);
+            if (name == 'function_call') {
+                function_call = JSON.parse(content.replace(/^\s*\`\`\`json/, '').replace(/\`\`\`\s*$/, ''));
+                function_call.arguments = JSON.stringify(function_call.arguments);
+                content = null;
+                name = undefined;
+            }
+            template.options.messages.push({
+                "role": role,
+                "content": content,
+                "name": name,
+                "function_call": function_call,
+            });
+            console.log(template.options.messages[template.options.messages.length - 1]);
         }
     }
-    else if (mode === "complete") {
-        options["prompt"] = rawPrompt;
+    else if (template.mode === "complete") {
+        template.options.prompt = rawPrompt;
     }
-    return options;
+    return template;
 }
-function unserializePromptTemplate(options) {
-    options = { ...options };
-    const mode = options["mode"] || "chat";
+function unserializePromptTemplate(templ) {
+    let template = { ...templ, 'options': { ...templ.options } };
     let rawPrompt = '';
-    if (mode == 'chat') {
-        let messages = options['messages'];
+    if (template.mode == 'chat') {
+        let messages = template.options.messages;
         rawPrompt += "\n";
         for (const message of messages) {
-            rawPrompt += `[${message.role}]\n\n${message.content}`;
-            if (message.content) {
+            let role = message.role;
+            let name = message.name;
+            let content = message.content;
+            if (message.function_call != null) {
+                name = 'function_call';
+                message.function_call.arguments = JSON.parse(message.function_call.arguments);
+                content = '\`\`\`json\n' + JSON.stringify(message.function_call, null, 2) + '\n\`\`\`';
+            }
+            rawPrompt += `[${role}${name ? ':' : ''}${name || ''}]\n\n${content}`;
+            if (content) {
                 if (message != messages[messages.length - 1]) {
                     rawPrompt += "\n\n";
                 }
             }
         }
     }
-    else if (mode == 'complete') {
-        rawPrompt = options['prompt'];
+    else if (template.mode == 'complete') {
+        rawPrompt = template.options.prompt;
     }
-    delete options['messages'];
-    delete options['prompt'];
-    return '---\n' + yaml.dump(options) + '---\n' + rawPrompt;
+    delete template.options['messages'];
+    delete template.options['prompt'];
+    return '---\n' + yaml.dump(template) + '---\n' + rawPrompt;
 }
 function getContextModel(usageStore, tokens, model) {
     for (let i = 0; i < usageStore[model].length; i++) {
@@ -106,18 +168,23 @@ function getContextModel(usageStore, tokens, model) {
         }
     }
 }
-function countPromptTemplateInputTokens(encoding, options) {
+function countPromptTemplateInputTokens(encoding, template) {
     let num_tokens = 0;
-    if (options['mode'] == 'chat') {
-        for (let i = 0; i < options['messages'].length; i++) {
-            const message = options['messages'][i];
-            let tokens = encoding.encode(message.content);
+    if (template.mode == 'chat') {
+        for (let i = 0; i < template['options']['messages'].length; i++) {
+            const message = template['options']['messages'][i];
+            let tokens = encoding.encode(message.content || (message.function_call.name ? JSON.stringify(message.function_call?.arguments) + message.function_call?.name : ''));
+            num_tokens += tokens.length;
+        }
+        if (template.options['functions'] != null) {
+            const functionsString = JSON.stringify(template.options['functions']);
+            let tokens = encoding.encode(functionsString);
             num_tokens += tokens.length;
         }
         return num_tokens;
     }
     else {
-        num_tokens += encoding.encode(options['prompt']).length;
+        num_tokens += encoding.encode(template.options['prompt']).length;
         return num_tokens;
     }
 }
@@ -153,9 +220,6 @@ function activate(context) {
             throw new Error("A completion is already in progress.");
         }
         let encoding = new lite_1.Tiktoken(cl100k_base_json_1.default.bpe_ranks, cl100k_base_json_1.default.special_tokens, cl100k_base_json_1.default.pat_str);
-        let options = {
-            stream: true,
-        };
         let inputTokenCount = 0;
         let outputTokenCount = 0;
         try {
@@ -169,32 +233,24 @@ function activate(context) {
             }
             let completeFilename = editor.document.fileName;
             let text = editor.document.getText();
-            let defaultPromptTemplate = config.get('defaultMarkdownChat') || DEFAULT_PROMPT_TEMPLATE;
-            let currentPromptTemplate = serializePromptTemplate(text);
-            if (defaultPromptTemplate['mode'] == currentPromptTemplate['mode']) {
-                currentPromptTemplate = {
-                    ...defaultPromptTemplate,
-                    ...currentPromptTemplate
-                };
-            }
-            options = {
-                ...currentPromptTemplate,
-                stream: true,
-            };
-            inputTokenCount += countPromptTemplateInputTokens(encoding, options);
-            let mode = options['mode'];
-            delete options['mode'];
-            if (mode == 'chat' && options.messages.length === 0) {
+            let template = await serializePromptTemplate(text, true);
+            inputTokenCount += countPromptTemplateInputTokens(encoding, template);
+            if (template.mode == 'chat' && template.options.messages.length === 0) {
                 throw new Error("The chat doesn't contain any messages");
             }
             const openai = new openai_1.default({ apiKey: config.get('apiKey') });
             let stream;
-            if (mode == 'chat') {
-                stream = await openai.chat.completions.create(options);
+            let requestOptions = {
+                ...template.options,
+                stream: true,
+            };
+            console.log(requestOptions);
+            if (template.mode == 'chat') {
+                stream = await openai.chat.completions.create(requestOptions);
                 outputTokenCount += 3;
             }
             else {
-                stream = await openai.completions.create(options);
+                stream = await openai.completions.create(requestOptions);
             }
             let chunks = [];
             let lastChunkAppend = null;
@@ -233,13 +289,12 @@ function activate(context) {
                 return ok;
             }
             await appendChunk('', true);
-            if (mode == 'chat') {
+            if (template.mode == 'chat') {
                 const endNewlinesMatch = text.match(/\n*$/);
                 const endNewlinesCountDiff = 2 - (endNewlinesMatch ? endNewlinesMatch[0].length : 0);
                 if (endNewlinesCountDiff > 0) {
                     await appendChunk('\n'.repeat(endNewlinesCountDiff));
                 }
-                await appendChunk('[assistant]\n\n');
             }
             let finish_reason = null;
             let responsePromise = new Promise((resolve, reject) => {
@@ -256,37 +311,64 @@ function activate(context) {
                 });
                 return responsePromise;
             });
+            let callingFunction;
             for await (const part of stream) {
                 if (finish_reason !== null) {
                     break;
                 }
                 let insert;
-                if (mode == 'chat') {
-                    insert = part.choices[0]?.delta?.content || '';
+                if (template.mode == 'chat') {
+                    let delta = part.choices[0].delta;
+                    console.log(delta);
+                    if (delta.role) {
+                        let name = '';
+                        if (delta.name != null) {
+                            name = ":" + delta.name;
+                        }
+                        if (delta.function_call != null) {
+                            name = ":function_call";
+                            callingFunction = delta.function_call.name;
+                        }
+                        await appendChunk(`[${delta.role}${name}]\n\n`);
+                        if (callingFunction) {
+                            await appendChunk(`\`\`\`json\n{\n  "name": "${delta.function_call.name}",\n  "arguments": `);
+                        }
+                    }
+                    insert = delta.function_call?.arguments || delta.content || '';
+                    if (callingFunction) {
+                        insert = insert.replace('\n', '\n  ');
+                    }
                 }
                 else {
                     insert = part.choices[0].text || '';
                 }
-                await appendChunk(insert);
                 if (insert != "") {
                     outputTokenCount += encoding.encode(insert).length;
+                    await appendChunk(insert);
                 }
                 finish_reason = part.choices[0]?.finish_reason;
             }
+            if (callingFunction) {
+                await appendChunk('\n}\n```');
+            }
             let models = { ...config.get('models') };
-            let model = options['model'];
-            let ci = getContextModel(models, options.max_tokens, model);
+            let model = template.options['model'];
+            let ci = getContextModel(models, template.options.max_tokens, model);
             models[model][ci]['inputCount'] += inputTokenCount;
             models[model][ci]['outputCount'] += outputTokenCount;
             let cost = inputTokenCount * models[model][ci]['inputPrice'] / 1000 + outputTokenCount * models[model][ci]['outputPrice'] / 1000;
             totalSessionCost += cost;
             updateLastCostStatusBarItem(cost);
             config.update('models', models, vscode.ConfigurationTarget.Global);
-            if (finish_reason !== 'stop' && finish_reason !== 'user') {
+            if (finish_reason !== 'stop' && finish_reason !== 'user' && finish_reason !== 'function_call') {
                 throw new Error('Stopped. Reason: ' + finish_reason);
             }
-            else if (mode == 'chat') {
-                await appendChunk('\n\n[user]\n\n', true);
+            else if (template.mode == 'chat') {
+                let responder = 'user';
+                if (callingFunction) {
+                    responder = "function:" + callingFunction;
+                }
+                await appendChunk(`\n\n[${responder}]\n\n`, true);
             }
             resolveFetchResponse();
             // let waitPromise = new Promise((resolve, reject) => {
@@ -339,7 +421,7 @@ function activate(context) {
         const newSelection = new vscode.Selection(position, position);
         editor.selection = newSelection;
     });
-    let setMarkdownChatAsDefault = vscode.commands.registerCommand('markdown-chat.setMarkdownChatAsDefault', () => {
+    let setMarkdownChatAsDefault = vscode.commands.registerCommand('markdown-chat.setMarkdownChatAsDefault', async () => {
         let config = vscode.workspace.getConfiguration('markdown-chat');
         const editor = vscode.window.activeTextEditor;
         if (!editor) {
@@ -348,20 +430,20 @@ function activate(context) {
         }
         const document = editor.document;
         let text = document.getText();
-        let markdownChat = serializePromptTemplate(text);
-        if (!('model' in markdownChat)) {
-            vscode.window.showErrorMessage('The default chat is missing "model" in its metadata.');
+        let template = await serializePromptTemplate(text);
+        if (template.options['model'] == null) {
+            vscode.window.showErrorMessage('The default chat is missing "options.model" in its metadata.');
             return;
         }
-        if (!('mode' in markdownChat)) {
+        if (template['mode'] == null) {
             vscode.window.showErrorMessage('The default chat is missing "mode" in its metadata.');
             return;
         }
-        if (!('max_tokens' in markdownChat)) {
-            vscode.window.showErrorMessage('The default chat is missing "max_tokens" in its metadata.');
+        if (template.options['max_tokens'] == null) {
+            vscode.window.showErrorMessage('The default chat is missing "options.max_tokens" in its metadata.');
             return;
         }
-        config.update('defaultMarkdownChat', markdownChat, vscode.ConfigurationTarget.Global);
+        config.update('defaultMarkdownChat', template, vscode.ConfigurationTarget.Global);
         vscode.window.showInformationMessage('The default chat has been set to the current document.');
     });
     context.subscriptions.push(setApiKey, completeMarkdownChat, newMarkdownChat, setMarkdownChatAsDefault);

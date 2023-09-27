@@ -5,95 +5,175 @@ import * as vscode from 'vscode';
 import * as yaml from 'js-yaml';
 import OpenAI from 'openai';
 
+import * as nunjucks from 'nunjucks'
+
 import { Tiktoken } from "tiktoken/lite";
 import cl100k_base from "tiktoken/encoders/cl100k_base.json";
 
-
 let lastCostStatusBarItem: vscode.StatusBarItem;
 
-const regexSplitMessages = /(^|\n)\n?\[([a-z]+)\] *\n{0,2}/g
+const regexSplitMessages = /(^|\n)\n?\[([a-zA-Z0-9\:\_]+)\] *\n{0,2}/g
 
 const DEFAULT_PROMPT_TEMPLATE = {
     "mode": "chat",
-    "model": "gpt-4",
-    "temperature": 0.75,
-    "max_tokens": 500,
-    "messages": [
-      {
-        "role": "system",
-        "content": "You are a helpful assistant. Answer in markdown."
-      },
-      {
-        "role": "user",
-        "content": ""
-      }
-    ]
-  }
-
-type PromptTemplate = string;
-type PromptOptions = {[index: string]: any};
+    "options": {
+        "model": "gpt-4",
+        "temperature": 0.75,
+        "max_tokens": 500,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Answer in markdown."
+            },
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {
+                    'name': 'get_weather',
+                    'arguments': '{"region": "USA"}'
+                }
+            },
+            {
+                "role": "function",
+                "name": "get_weather",
+                "content": "The result of the function"
+            }
+        ]
+    }
+}
 
 let completionInProgress = false;
 
 let totalSessionCost: number = 0
 
-function serializePromptTemplate(text: PromptTemplate): PromptOptions {
-    let options: PromptOptions = {};
+async function serializePromptTemplate(text: string, interactive: boolean = false): Promise<any> {
+    let template: any = {};
 
     const metadataSplit = text.split(/^---\n/m);
     let rawPrompt = text;
 
     if (metadataSplit[0] === "" && metadataSplit.length >= 3) {
-        options = <any>yaml.load(metadataSplit[1]);
+        template = <any>yaml.load(metadataSplit[1]);
         rawPrompt = metadataSplit.slice(2).join("---");
     }
 
-    const mode = options["mode"] || "chat";
-
-    if (mode === "chat") {
-        const messagesSplit = rawPrompt.split(regexSplitMessages);
-
-        options["messages"] = [];
-
-        for (let i = 1; i < messagesSplit.length; i += 3) {
-            options["messages"].push({"role": messagesSplit[i + 1], "content": messagesSplit[i + 2]});
+    if (template.nunjucks !== false && interactive) {
+        let env = new nunjucks.Environment()
+        
+        if (typeof template.nunjucks === 'object') {
+            env.options = template.nunjucks;
         }
-    } else if (mode === "complete") {
-        options["prompt"] = rawPrompt;
+
+        let context: any = {...template}
+
+        if (template.inputs != null) {
+            for (let i = 0; i < template.inputs.length; i++) {
+                const input = template.inputs[i];
+
+                let value = input.value;
+                let prompt = input.prompt;
+
+                if (prompt) {
+
+                    value = await new Promise((resolve, reject) => {
+                        vscode.window
+                            .showInputBox({
+                                prompt: `Assign ${input.name} a value`,
+                                ignoreFocusOut: true,
+                                value: input.value || '',
+                            })
+                            .then(resolve, reject);
+                    })
+                }
+                
+                context[input.name] = value;
+            }
+        }
+
+        rawPrompt = env.renderString(rawPrompt, context)
     }
 
-    return options;
+    if (template.mode === "chat") {
+        const messagesSplit = rawPrompt.split(regexSplitMessages);
+
+        console.log(messagesSplit);
+        
+
+        template.options.messages = [];
+
+        for (let i = 1; i < messagesSplit.length; i += 3) {
+
+            let [role, name]: any = messagesSplit[i + 1].split(':')
+
+            let content: string | null = messagesSplit[i + 2]
+
+            let function_call;
+
+            console.log(role, name, content);
+            
+
+            if (name == 'function_call') {
+                function_call = JSON.parse(content.replace(/^\s*\`\`\`json/, '').replace(/\`\`\`\s*$/, ''))
+                function_call.arguments = JSON.stringify(function_call.arguments)
+                content = null;
+                name = undefined;
+            }
+
+            template.options.messages.push({
+                "role": role,
+                "content": content,
+                "name": name,
+                "function_call": function_call,
+            });
+
+            console.log(template.options.messages[template.options.messages.length - 1]);
+        }
+    } else if (template.mode === "complete") {
+        template.options.prompt = rawPrompt;
+    }
+
+    return template;
 }
 
-function unserializePromptTemplate(options: any): string {
-    options = {...options}
-    
-    const mode = options["mode"] || "chat";
+function unserializePromptTemplate(templ: any): string {
+    let template = { ...templ, 'options': {...templ.options} };
 
     let rawPrompt = ''
 
-    if (mode == 'chat') {
-        let messages = options['messages'];
+    if (template.mode == 'chat') {
+        let messages = template.options.messages;
 
         rawPrompt += "\n"
         
         for (const message of messages) {
-            rawPrompt += `[${message.role}]\n\n${message.content}`;
-            if (message.content) {
+            
+            let role = message.role
+            let name = message.name
+            let content = message.content
+
+            if (message.function_call != null) {
+                name = 'function_call';
+                message.function_call.arguments = JSON.parse(message.function_call.arguments)
+                content = '\`\`\`json\n' + JSON.stringify(message.function_call, null, 2) + '\n\`\`\`'
+            }
+
+            rawPrompt += `[${ role }${ name ? ':' : '' }${ name || '' }]\n\n${ content }`;
+            
+            if (content) {
                 if (message != messages[messages.length - 1]) {
                     rawPrompt += "\n\n";
                 }
             }
         }
-    } else if (mode == 'complete') {
+    } else if (template.mode == 'complete') {
 
-        rawPrompt = options['prompt']
+        rawPrompt = template.options.prompt
     }
 
-    delete options['messages'];
-    delete options['prompt'];
+    delete template.options['messages'];
+    delete template.options['prompt'];
     
-    return '---\n' + yaml.dump(options) + '---\n' + rawPrompt;
+    return '---\n' + yaml.dump(template) + '---\n' + rawPrompt;
 }
 
 function getContextModel(usageStore: any, tokens: number, model: string): any {
@@ -104,20 +184,26 @@ function getContextModel(usageStore: any, tokens: number, model: string): any {
     }
 }
 
-function countPromptTemplateInputTokens(encoding: any, options: any): number {
+function countPromptTemplateInputTokens(encoding: any, template: any): number {
     let num_tokens = 0
 
-    if (options['mode'] == 'chat') {
+    if (template.mode == 'chat') {
 
-        for (let i = 0; i < options['messages'].length; i++) {
-            const message = options['messages'][i];
-            let tokens = encoding.encode(message.content)
+        for (let i = 0; i < template['options']['messages'].length; i++) {
+            const message = template['options']['messages'][i];
+            let tokens = encoding.encode(message.content || (message.function_call.name ? JSON.stringify(message.function_call?.arguments) + message.function_call?.name : ''))
+            num_tokens += tokens.length
+        }
+
+        if (template.options['functions'] != null) {
+            const functionsString = JSON.stringify(template.options['functions'])
+            let tokens = encoding.encode(functionsString)
             num_tokens += tokens.length
         }
 
         return num_tokens
     } else {
-        num_tokens += encoding.encode(options['prompt']).length
+        num_tokens += encoding.encode(template.options['prompt']).length
         return num_tokens
     }
 }
@@ -168,10 +254,6 @@ export function activate(context: vscode.ExtensionContext) {
             cl100k_base.pat_str
         );
 
-        let options: {stream: true} & {[key: string]: any;} = {
-            stream: true,
-        };
-
         let inputTokenCount = 0
         let outputTokenCount = 0
 
@@ -192,29 +274,12 @@ export function activate(context: vscode.ExtensionContext) {
 
             let text = editor.document.getText();
 
-            let defaultPromptTemplate = <any>config.get('defaultMarkdownChat') || DEFAULT_PROMPT_TEMPLATE
-
-            let currentPromptTemplate = serializePromptTemplate(text)
+            let template = await serializePromptTemplate(text, true)
 
 
-            if (defaultPromptTemplate['mode'] == currentPromptTemplate['mode']) {
-                currentPromptTemplate = {
-                    ...defaultPromptTemplate,
-                    ...currentPromptTemplate
-                }
-            }
+            inputTokenCount += countPromptTemplateInputTokens(encoding, template)
 
-            options = {
-                ...currentPromptTemplate,
-                stream: true,
-            };
-
-            inputTokenCount += countPromptTemplateInputTokens(encoding, options)
-
-            let mode = options['mode'];
-            delete options['mode'];
-
-            if (mode == 'chat' && options.messages.length === 0) {
+            if (template.mode == 'chat' && template.options.messages.length === 0) {
                 throw new Error("The chat doesn't contain any messages");
             }
 
@@ -222,11 +287,18 @@ export function activate(context: vscode.ExtensionContext) {
 
             let stream;
 
-            if (mode == 'chat') {
-                stream = await openai.chat.completions.create(<any>options)
+            let requestOptions = {
+                ...template.options,
+                stream: true,
+            }
+
+            console.log(requestOptions)
+
+            if (template.mode == 'chat') {
+                stream = await openai.chat.completions.create(<any>requestOptions)
                 outputTokenCount += 3
             } else {
-                stream = await openai.completions.create(<any>options)
+                stream = await openai.completions.create(<any>requestOptions)
             }
 
             let chunks: string[] = [];
@@ -282,15 +354,13 @@ export function activate(context: vscode.ExtensionContext) {
 
             await appendChunk('', true);
 
-            if (mode == 'chat') {
+            if (template.mode == 'chat') {
                 const endNewlinesMatch = text.match(/\n*$/);
                 const endNewlinesCountDiff = 2 - (endNewlinesMatch ? endNewlinesMatch[0].length : 0);
         
                 if (endNewlinesCountDiff > 0) {
                     await appendChunk('\n'.repeat(endNewlinesCountDiff));
                 }
-
-                await appendChunk('[assistant]\n\n');
             }
 
             let finish_reason: string | null = null;
@@ -311,6 +381,8 @@ export function activate(context: vscode.ExtensionContext) {
             
                 return responsePromise;
             });
+
+            let callingFunction;
             
             for await (const part of <any>stream) {
                 if (finish_reason !== null) {
@@ -319,26 +391,60 @@ export function activate(context: vscode.ExtensionContext) {
 
                 let insert: string 
 
-                if (mode == 'chat') {
-                    insert = part.choices[0]?.delta?.content || ''
+
+                if (template.mode == 'chat') {
+
+                    let delta = part.choices[0].delta
+
+                    console.log(delta);
+    
+                    if (delta.role) {
+                        let name = ''
+
+                        if (delta.name != null) {
+                            name = ":" + delta.name
+                        }
+
+                        if (delta.function_call != null) {
+                            name = ":function_call"
+                            callingFunction = delta.function_call.name;
+                        }
+
+                        await appendChunk(`[${delta.role}${ name }]\n\n`);
+
+                        if (callingFunction) {
+                            await appendChunk(`\`\`\`json\n{\n  "name": "${delta.function_call.name}",\n  "arguments": `);
+                        }
+                    }
+
+                    
+
+                    insert = delta.function_call?.arguments || delta.content || '';
+
+                    if (callingFunction) {
+                        insert = insert.replace('\n', '\n  ')
+                    }
                 } else {
-                    insert = part.choices[0].text || ''
+                    insert = part.choices[0].text || '';
                 }
-                await appendChunk(insert);
                 
                 if (insert != "") {
                     outputTokenCount += encoding.encode(insert).length
+                    await appendChunk(insert);
                 } 
                 
                 finish_reason = part.choices[0]?.finish_reason;
             }
 
+            if (callingFunction) {
+                await appendChunk('\n}\n```');
+            }
 
             let models: {[key: string]: any} = {... config.get('models')!}
             
-            let model = options['model']
+            let model = template.options['model']
 
-            let ci = getContextModel(models, options.max_tokens, model)
+            let ci = getContextModel(models, template.options.max_tokens, model)
 
             models[model][ci]['inputCount'] += inputTokenCount
             models[model][ci]['outputCount'] += outputTokenCount
@@ -351,10 +457,14 @@ export function activate(context: vscode.ExtensionContext) {
 
             config.update('models', models, vscode.ConfigurationTarget.Global);
 
-            if (finish_reason !== 'stop' && finish_reason !== 'user') {
+            if (finish_reason !== 'stop' && finish_reason !== 'user' && finish_reason !== 'function_call') {
                 throw new Error('Stopped. Reason: ' + finish_reason)
-            } else if (mode == 'chat') {
-                await appendChunk('\n\n[user]\n\n', true);
+            } else if (template.mode == 'chat') {
+                let responder = 'user'
+                if (callingFunction) {
+                    responder = "function:" + callingFunction
+                }
+                await appendChunk(`\n\n[${responder}]\n\n`, true);
             }
 
             resolveFetchResponse!();
@@ -422,7 +532,7 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
     
-    let setMarkdownChatAsDefault = vscode.commands.registerCommand('markdown-chat.setMarkdownChatAsDefault', () => {
+    let setMarkdownChatAsDefault = vscode.commands.registerCommand('markdown-chat.setMarkdownChatAsDefault', async () => {
         let config = vscode.workspace.getConfiguration('markdown-chat');
 
         const editor = vscode.window.activeTextEditor;
@@ -434,24 +544,24 @@ export function activate(context: vscode.ExtensionContext) {
         const document = editor.document;
 		let text = document.getText();
 
-        let markdownChat = serializePromptTemplate(text);
+        let template = await serializePromptTemplate(text);
 
-        if (!('model' in markdownChat)) {
-            vscode.window.showErrorMessage('The default chat is missing "model" in its metadata.');
+        if (template.options['model'] == null) {
+            vscode.window.showErrorMessage('The default chat is missing "options.model" in its metadata.');
             return;
         }
 
-        if (!('mode' in markdownChat)) {
+        if (template['mode'] == null) {
             vscode.window.showErrorMessage('The default chat is missing "mode" in its metadata.');
             return;
         }
 
-        if (!('max_tokens' in markdownChat)) {
-            vscode.window.showErrorMessage('The default chat is missing "max_tokens" in its metadata.');
+        if (template.options['max_tokens'] == null) {
+            vscode.window.showErrorMessage('The default chat is missing "options.max_tokens" in its metadata.');
             return;
         }
 
-        config.update('defaultMarkdownChat', markdownChat, vscode.ConfigurationTarget.Global);
+        config.update('defaultMarkdownChat', template, vscode.ConfigurationTarget.Global);
         vscode.window.showInformationMessage('The default chat has been set to the current document.');
     });
 
