@@ -58,7 +58,11 @@ async function serializePromptTemplate(text: string, interactive: boolean = fals
     }
 
     if (template.nunjucks !== false && interactive) {
-        let env = new nunjucks.Environment()
+        let env = new nunjucks.Environment(null, {
+            autoescape: false,
+            trimBlocks: true,
+            lstripBlocks: true,
+        })
         
         if (typeof template.nunjucks === 'object') {
             env.options = template.nunjucks;
@@ -218,6 +222,288 @@ function updateLastCostStatusBarItem(cost: number): void {
 	}
 }
 
+async function sendMarkdownChat(redo: boolean = false) {
+    let logerr;
+    
+    let resolveFetchResponse: any;
+    let rejectFetchResponse: any;
+
+    let config = vscode.workspace.getConfiguration('markdown-chat');
+
+    if (completionInProgress) {
+        throw new Error("A completion is already in progress.")
+    }
+
+    let encoding = new Tiktoken(
+        cl100k_base.bpe_ranks,
+        cl100k_base.special_tokens,
+        cl100k_base.pat_str
+    );
+
+    let inputTokenCount = 0
+    let outputTokenCount = 0
+
+    try {
+        completionInProgress = true;
+
+        let editor = vscode.window.activeTextEditor;
+
+        if (!editor) {
+            throw new Error('No editor found')
+        }
+
+        if (!editor.document) {
+            throw new Error('No document open')
+        }
+
+        let completeFilename = editor.document.fileName
+
+        let text = editor.document.getText();
+
+        let template = await serializePromptTemplate(text, true)
+
+
+        inputTokenCount += countPromptTemplateInputTokens(encoding, template)
+
+        if (template.mode == 'chat' && template.options.messages.length === 0) {
+            throw new Error("The chat doesn't contain any messages");
+        }
+
+        const openai = new OpenAI({apiKey: config.get('apiKey')});
+
+        let stream;
+
+        let requestOptions = {
+            ...template.options,
+            stream: true,
+        }
+
+        console.log(requestOptions)
+
+        if (template.mode == 'chat') {
+            stream = await openai.chat.completions.create(<any>requestOptions)
+            outputTokenCount += 3
+        } else {
+            stream = await openai.completions.create(<any>requestOptions)
+        }
+
+        let chunks: string[] = [];
+
+        let lastChunkAppend: Date | null = null;
+
+        async function appendChunk(chunk: string, insertUndo: boolean = false): Promise<boolean> {
+            chunks.push(chunk);
+            
+            editor = vscode.window.activeTextEditor
+
+            if (!editor) {
+                return false;
+            }
+
+            let document = editor.document
+
+            if (document == null || document.fileName != completeFilename) {
+                return false;
+            }
+
+            const waited = lastChunkAppend == null || (new Date().getTime() - lastChunkAppend.getTime()) >= 0;
+
+            if (!waited) {
+                return false;
+            }
+
+            let insert = "".concat(...chunks);
+
+            let ok: boolean = await new Promise((resolve, reject) => {
+                editor!.edit(editBuilder => {
+                    const lastLine = document!.lineAt(document!.lineCount - 1);
+                    const position = new vscode.Position(lastLine.lineNumber, lastLine.text.length);
+
+                    editBuilder.insert(position, insert);
+                }, {
+                    undoStopAfter: insertUndo,
+                    undoStopBefore: insertUndo,
+                }).then(resolve, (e) => {
+                    console.error(e)
+                    resolve(false)
+                });
+            })
+
+            if (ok) {
+                chunks = [];
+                lastChunkAppend = new Date();
+            }
+
+            return ok;
+
+        }
+
+        await appendChunk('', true);
+
+        if (template.mode == 'chat') {
+            const endNewlinesMatch = text.match(/\n*$/);
+            const endNewlinesCountDiff = 2 - (endNewlinesMatch ? endNewlinesMatch[0].length : 0);
+    
+            if (endNewlinesCountDiff > 0) {
+                await appendChunk('\n'.repeat(endNewlinesCountDiff));
+            }
+        }
+
+        let finish_reason: string | null = null;
+
+        let responsePromise = new Promise((resolve, reject) => {
+            resolveFetchResponse = resolve;
+            rejectFetchResponse = reject;
+        });
+
+        vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: "Getting answer from OpenAI...",
+            cancellable: true
+        }, (progress, token) => {
+            token.onCancellationRequested(() => {
+                finish_reason = 'user';
+            });
+        
+            return responsePromise;
+        });
+
+        let callingFunction;
+        
+        for await (const part of <any>stream) {
+            if (finish_reason !== null) {
+                break;
+            }
+
+            let insert: string 
+
+
+            if (template.mode == 'chat') {
+
+                let delta = part.choices[0].delta
+
+                console.log(delta);
+
+                if (delta.role) {
+                    let name = ''
+
+                    if (delta.name != null) {
+                        name = ":" + delta.name
+                    }
+
+                    if (delta.function_call != null) {
+                        name = ":function_call"
+                        callingFunction = delta.function_call.name;
+                    }
+
+                    await appendChunk(`[${delta.role}${ name }]\n\n`);
+
+                    if (callingFunction) {
+                        await appendChunk(`\`\`\`json\n{\n  "name": "${delta.function_call.name}",\n  "arguments": `);
+                    }
+                }
+
+                
+
+                insert = delta.function_call?.arguments || delta.content || '';
+
+                if (callingFunction) {
+                    insert = insert.replace('\n', '\n  ')
+                }
+            } else {
+                insert = part.choices[0].text || '';
+            }
+            
+            if (insert != "") {
+                outputTokenCount += encoding.encode(insert).length
+                await appendChunk(insert);
+            } 
+            
+            finish_reason = part.choices[0]?.finish_reason;
+        }
+
+        if (callingFunction) {
+            await appendChunk('\n}\n```');
+        }
+
+        let models: {[key: string]: any} = {... config.get('models')!}
+        
+        let model = template.options['model']
+
+        let ci = getContextModel(models, template.options.max_tokens, model)
+
+        models[model][ci]['inputCount'] += inputTokenCount
+        models[model][ci]['outputCount'] += outputTokenCount
+
+        let cost = inputTokenCount * models[model][ci]['inputPrice']/1000 + outputTokenCount * models[model][ci]['outputPrice']/1000
+        
+        totalSessionCost += cost
+
+        updateLastCostStatusBarItem(cost)
+
+        config.update('models', models, vscode.ConfigurationTarget.Global);
+
+        if (finish_reason !== 'stop' && finish_reason !== 'user' && finish_reason !== 'function_call') {
+            throw new Error('Stopped. Reason: ' + finish_reason)
+        } else if (template.mode == 'chat') {
+            let responder = 'user'
+            if (callingFunction) {
+                responder = "function:" + callingFunction
+            }
+            await appendChunk(`\n\n[${responder}]\n\n`, true);
+        }
+
+        resolveFetchResponse!();
+
+        // let waitPromise = new Promise((resolve, reject) => {
+        //     resolveWaitInsert = resolve;
+        //     rejectWaitInsert = reject
+        // });
+
+        if (chunks.length > 0) {
+            vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: "Completion finished, but cannot insert result until the prompt file is opened.",
+                cancellable: true
+            }, (progress, token) => {
+                
+                return new Promise<void>(async (resolve, reject) => {
+                    // resolveWaitInsert = resolve;
+                    // rejectWaitInsert = reject;
+                    
+                    let loop = true
+
+                    token.onCancellationRequested(() => {
+                        loop = false;
+                        reject("Result has been deleted.")
+                    });
+
+                    while (loop) {
+                        loop = !(await appendChunk('', false));
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                    }
+
+                    resolve()
+                })
+
+            });
+        }
+
+    } catch (error) {
+        logerr = error
+    } finally {
+        completionInProgress = false;
+        encoding.free();
+
+        if (rejectFetchResponse) rejectFetchResponse();
+        
+        if (logerr != null) {
+            console.error(logerr);
+            throw logerr;
+        }
+    }
+}
+
 export function activate(context: vscode.ExtensionContext) {
 
 	// create a new status bar item that we can now manage
@@ -236,287 +522,7 @@ export function activate(context: vscode.ExtensionContext) {
         });
     });
 	
-    let completeMarkdownChat = vscode.commands.registerCommand('markdown-chat.sendMarkdownChat', async () => {
-        let logerr;
-        
-        let resolveFetchResponse: any;
-        let rejectFetchResponse: any;
-
-        let config = vscode.workspace.getConfiguration('markdown-chat');
-
-        if (completionInProgress) {
-            throw new Error("A completion is already in progress.")
-        }
-
-        let encoding = new Tiktoken(
-            cl100k_base.bpe_ranks,
-            cl100k_base.special_tokens,
-            cl100k_base.pat_str
-        );
-
-        let inputTokenCount = 0
-        let outputTokenCount = 0
-
-        try {
-            completionInProgress = true;
-
-            let editor = vscode.window.activeTextEditor;
-
-            if (!editor) {
-                throw new Error('No editor found')
-            }
-
-            if (!editor.document) {
-                throw new Error('No document open')
-            }
-
-            let completeFilename = editor.document.fileName
-
-            let text = editor.document.getText();
-
-            let template = await serializePromptTemplate(text, true)
-
-
-            inputTokenCount += countPromptTemplateInputTokens(encoding, template)
-
-            if (template.mode == 'chat' && template.options.messages.length === 0) {
-                throw new Error("The chat doesn't contain any messages");
-            }
-
-            const openai = new OpenAI({apiKey: config.get('apiKey')});
-
-            let stream;
-
-            let requestOptions = {
-                ...template.options,
-                stream: true,
-            }
-
-            console.log(requestOptions)
-
-            if (template.mode == 'chat') {
-                stream = await openai.chat.completions.create(<any>requestOptions)
-                outputTokenCount += 3
-            } else {
-                stream = await openai.completions.create(<any>requestOptions)
-            }
-
-            let chunks: string[] = [];
-
-            let lastChunkAppend: Date | null = null;
-
-            async function appendChunk(chunk: string, insertUndo: boolean = false): Promise<boolean> {
-                chunks.push(chunk);
-                
-                editor = vscode.window.activeTextEditor
-
-                if (!editor) {
-                    return false;
-                }
-
-                let document = editor.document
-
-                if (document == null || document.fileName != completeFilename) {
-                    return false;
-                }
-
-                const waited = lastChunkAppend == null || (new Date().getTime() - lastChunkAppend.getTime()) >= 0;
-
-                if (!waited) {
-                    return false;
-                }
-
-                let insert = "".concat(...chunks);
-
-                let ok: boolean = await new Promise((resolve, reject) => {
-                    editor!.edit(editBuilder => {
-                        const lastLine = document!.lineAt(document!.lineCount - 1);
-                        const position = new vscode.Position(lastLine.lineNumber, lastLine.text.length);
-
-                        editBuilder.insert(position, insert);
-                    }, {
-                        undoStopAfter: insertUndo,
-                        undoStopBefore: insertUndo,
-                    }).then(resolve, (e) => {
-                        console.error(e)
-                        resolve(false)
-                    });
-                })
-
-                if (ok) {
-                    chunks = [];
-                    lastChunkAppend = new Date();
-                }
-
-                return ok;
-
-            }
-
-            await appendChunk('', true);
-
-            if (template.mode == 'chat') {
-                const endNewlinesMatch = text.match(/\n*$/);
-                const endNewlinesCountDiff = 2 - (endNewlinesMatch ? endNewlinesMatch[0].length : 0);
-        
-                if (endNewlinesCountDiff > 0) {
-                    await appendChunk('\n'.repeat(endNewlinesCountDiff));
-                }
-            }
-
-            let finish_reason: string | null = null;
-
-            let responsePromise = new Promise((resolve, reject) => {
-                resolveFetchResponse = resolve;
-                rejectFetchResponse = reject;
-            });
-
-            vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: "Getting answer from OpenAI...",
-                cancellable: true
-            }, (progress, token) => {
-                token.onCancellationRequested(() => {
-                    finish_reason = 'user';
-                });
-            
-                return responsePromise;
-            });
-
-            let callingFunction;
-            
-            for await (const part of <any>stream) {
-                if (finish_reason !== null) {
-                    break;
-                }
-
-                let insert: string 
-
-
-                if (template.mode == 'chat') {
-
-                    let delta = part.choices[0].delta
-
-                    console.log(delta);
-    
-                    if (delta.role) {
-                        let name = ''
-
-                        if (delta.name != null) {
-                            name = ":" + delta.name
-                        }
-
-                        if (delta.function_call != null) {
-                            name = ":function_call"
-                            callingFunction = delta.function_call.name;
-                        }
-
-                        await appendChunk(`[${delta.role}${ name }]\n\n`);
-
-                        if (callingFunction) {
-                            await appendChunk(`\`\`\`json\n{\n  "name": "${delta.function_call.name}",\n  "arguments": `);
-                        }
-                    }
-
-                    
-
-                    insert = delta.function_call?.arguments || delta.content || '';
-
-                    if (callingFunction) {
-                        insert = insert.replace('\n', '\n  ')
-                    }
-                } else {
-                    insert = part.choices[0].text || '';
-                }
-                
-                if (insert != "") {
-                    outputTokenCount += encoding.encode(insert).length
-                    await appendChunk(insert);
-                } 
-                
-                finish_reason = part.choices[0]?.finish_reason;
-            }
-
-            if (callingFunction) {
-                await appendChunk('\n}\n```');
-            }
-
-            let models: {[key: string]: any} = {... config.get('models')!}
-            
-            let model = template.options['model']
-
-            let ci = getContextModel(models, template.options.max_tokens, model)
-
-            models[model][ci]['inputCount'] += inputTokenCount
-            models[model][ci]['outputCount'] += outputTokenCount
-
-            let cost = inputTokenCount * models[model][ci]['inputPrice']/1000 + outputTokenCount * models[model][ci]['outputPrice']/1000
-            
-            totalSessionCost += cost
-
-            updateLastCostStatusBarItem(cost)
-
-            config.update('models', models, vscode.ConfigurationTarget.Global);
-
-            if (finish_reason !== 'stop' && finish_reason !== 'user' && finish_reason !== 'function_call') {
-                throw new Error('Stopped. Reason: ' + finish_reason)
-            } else if (template.mode == 'chat') {
-                let responder = 'user'
-                if (callingFunction) {
-                    responder = "function:" + callingFunction
-                }
-                await appendChunk(`\n\n[${responder}]\n\n`, true);
-            }
-
-            resolveFetchResponse!();
-
-            // let waitPromise = new Promise((resolve, reject) => {
-            //     resolveWaitInsert = resolve;
-            //     rejectWaitInsert = reject
-            // });
-
-            if (chunks.length > 0) {
-                vscode.window.withProgress({
-                    location: vscode.ProgressLocation.Notification,
-                    title: "Completion finished, but cannot insert result until the prompt file is opened.",
-                    cancellable: true
-                }, (progress, token) => {
-                    
-                    return new Promise<void>(async (resolve, reject) => {
-                        // resolveWaitInsert = resolve;
-                        // rejectWaitInsert = reject;
-                        
-                        let loop = true
-    
-                        token.onCancellationRequested(() => {
-                            loop = false;
-                            reject("Result has been deleted.")
-                        });
-
-                        while (loop) {
-                            loop = !(await appendChunk('', false));
-                            await new Promise(resolve => setTimeout(resolve, 500));
-                        }
-
-                        resolve()
-                    })
-
-                });
-            }
-
-        } catch (error) {
-            logerr = error
-        } finally {
-            completionInProgress = false;
-            encoding.free();
-
-            if (rejectFetchResponse) rejectFetchResponse();
-            
-            if (logerr != null) {
-                console.error(logerr);
-                throw logerr;
-            }
-        }
-	});
+    let completeMarkdownChat = vscode.commands.registerCommand('markdown-chat.sendMarkdownChat', sendMarkdownChat);
 
     let newMarkdownChat = vscode.commands.registerCommand('markdown-chat.newMarkdownChat', async () => {
         let config = vscode.workspace.getConfiguration('markdown-chat');
